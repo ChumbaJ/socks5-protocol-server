@@ -1,12 +1,27 @@
 package main
 
 import (
-	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 )
+
+const (
+	RepSuccess          = byte(0x00)
+	RepFailure          = byte(0x01)
+	RepNotAllowed       = byte(0x02)
+	RepNetUnreachable   = byte(0x03)
+	RepHostUnreachable  = byte(0x04)
+	RepRefused          = byte(0x05)
+	RepTTLExpired       = byte(0x06)
+	RepCmdNotSupported  = byte(0x07)
+	RepAddrNotSupported = byte(0x08)
+)
+
+func serverReply(conn net.Conn, rep byte) {
+	conn.Write([]byte{0x05, rep, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+}
 
 func handleConn(conn net.Conn) {
 	defer func() {
@@ -14,47 +29,90 @@ func handleConn(conn net.Conn) {
 			fmt.Println("recovered from panic:", r)
 		}
 	}()
-
 	defer conn.Close()
 
-	fmt.Println("new conn:", conn.RemoteAddr())
+	// read greeting from client
+	buf := make([]byte, 2)
+	io.ReadFull(conn, buf)
 
-	reader := bufio.NewReader(conn)
-
-	req, err := http.ReadRequest(reader)
-	if err != nil {
-		fmt.Println(err.Error())
+	version := buf[0]
+	if version != 0x05 {
+		return // not socks5
 	}
 
-	if req.Method != http.MethodConnect {
+	nmethods := buf[1]
+	methods := make([]byte, nmethods)
+	io.ReadFull(conn, methods)
+
+	// select auth method - no auth 00
+	conn.Write([]byte{0x05, 0x00})
+
+	// read request from client
+	req := make([]byte, 4)
+	io.ReadFull(conn, req)
+
+	atyp := req[3]
+
+	var host string
+	var port uint16
+
+	switch atyp {
+	case 0x01:
+		addr := make([]byte, 4)
+		io.ReadFull(conn, addr)
+
+		host = net.IP(addr).String()
+	case 0x03:
+		addrLen := make([]byte, 1)
+		io.ReadFull(conn, addrLen)
+
+		domain := make([]byte, addrLen[0])
+		io.ReadFull(conn, domain)
+
+		host = string(domain)
+	case 0x04:
+		addr := make([]byte, 16)
+		io.ReadFull(conn, addr)
+
+		host = net.IP(addr).String()
+	default:
 		return
 	}
 
-	target, err := net.Dial("tcp4", req.Host)
+	portBytes := make([]byte, 2)
+	io.ReadFull(conn, portBytes)
+	port = binary.BigEndian.Uint16(portBytes)
+
+	// conn to target
+	address := fmt.Sprintf("%s:%d", host, port)
+	fmt.Printf("connecting to: %s\n", address)
+
+	targetConn, err := net.Dial("tcp", address)
 	if err != nil {
-		fmt.Println("dial error", err.Error())
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		serverReply(conn, RepFailure)
 		return
 	}
-	defer target.Close()
+	defer targetConn.Close()
 
-	conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	// send SUCCESS to client
+	serverReply(conn, RepSuccess)
 
-	errCh := make(chan error, 2)
+	// run bidirectional relay
 
+	errChan := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(target, conn)
-		errCh <- err
+		_, err := io.Copy(targetConn, conn)
+		errChan <- err
 	}()
 
 	go func() {
-		_, err = io.Copy(conn, target)
-		errCh <- err
+		_, err := io.Copy(conn, targetConn)
+		errChan <- err
 	}()
 
-	for err := range errCh {
-		if err != nil {
-			fmt.Println(err.Error())
+	for i := 0; i < 2; i++ {
+		if err := <-errChan; err != nil {
+			fmt.Printf("relay error: %s\n", err.Error())
 		}
 	}
 }
